@@ -1,5 +1,5 @@
 try:
-    import lvgl as lv
+    import lvgl._raw as lv
 except ImportError:
     import os
     import sys
@@ -7,7 +7,7 @@ except ImportError:
     base_path = os.path.dirname(__file__)
     sys.path.insert(0, os.path.abspath(os.path.join(base_path, '..', 'build')))
 
-    import lvgl as lv
+    import lvgl._raw as lv
 
 import time
 
@@ -55,11 +55,11 @@ def scroll_event(e):
         lv.obj_set_style_opa(chld, lv.OPA_COVER - opa, 0)
 
 
-cont = lv.obj_create(lv.scr_act())
+cont = lv.obj_create(lv.screen_active())
 lv.obj_set_size(cont, 200, 200)
 lv.obj_center(cont)
 lv.obj_set_flex_flow(cont, lv.FLEX_FLOW_COLUMN)
-lv.obj_add_event(cont, scroll_event, lv.EVENT_SCROLL)
+lv.obj_add_event_cb(cont, scroll_event, lv.EVENT_SCROLL, None)
 lv.obj_set_style_radius(cont, lv.RADIUS_CIRCLE, 0)
 lv.obj_set_style_clip_corner(cont, True, 0)
 lv.obj_set_scroll_dir(cont, lv.DIR_VER)
@@ -69,7 +69,7 @@ lv.obj_set_scrollbar_mode(cont, lv.SCROLLBAR_MODE_OFF)
 buttons = []
 
 for i in range(20):
-    btn = lv.btn_create(cont)
+    btn = lv.button_create(cont)
     buttons.append(btn)
     lv.obj_set_width(btn, lv.pct(100))
 
@@ -80,7 +80,7 @@ for i in range(20):
     lv.obj_send_event(cont, lv.EVENT_SCROLL, None)
 
     # Be sure the fist button is in the middle
-    lv.obj_scroll_to_view(lv.obj_get_child(cont, 0), lv.ANIM_OFF)
+lv.obj_scroll_to_view(lv.obj_get_child(cont, 0), False)
 
 
 start = time.time()

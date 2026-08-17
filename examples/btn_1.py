@@ -1,5 +1,5 @@
 try:
-    import lvgl as lv
+    import lvgl._raw as lv
 except ImportError:
     import os
     import sys
@@ -7,7 +7,7 @@ except ImportError:
     base_path = os.path.dirname(__file__)
     sys.path.insert(0, os.path.abspath(os.path.join(base_path, '..', 'build')))
 
-    import lvgl as lv
+    import lvgl._raw as lv
 
 import time
 
@@ -21,7 +21,7 @@ lv.indev_set_group(keyboard, group)
 
 
 # Normal button
-btn1 = lv.btn_create(lv.scr_act())
+btn1 = lv.button_create(lv.screen_active())
 lv.obj_set_size(btn1, 100, 40)
 lv.obj_align(btn1, lv.ALIGN_CENTER, 0, -70)
 
@@ -32,7 +32,7 @@ lv.obj_center(label1)
 # Set opacity
 # The button and the label is rendered
 # to a layer first and that layer is blended
-btn2 = lv.btn_create(lv.scr_act())
+btn2 = lv.button_create(lv.screen_active())
 lv.obj_set_size(btn2, 100, 40)
 lv.obj_set_style_opa(btn2, lv.OPA_50, 0)
 lv.obj_align(btn2, lv.ALIGN_CENTER, 0, 0)
@@ -44,10 +44,10 @@ lv.obj_center(label2)
 # Set transformations
 # The button and the label is rendered to
 # a layer first and that layer is transformed
-btn3 = lv.btn_create(lv.scr_act())
+btn3 = lv.button_create(lv.screen_active())
 lv.obj_set_size(btn3, 100, 40)
-lv.obj_set_style_transform_angle(btn3, 150, 0)             # 15 deg
-lv.obj_set_style_transform_zoom(btn3, 256 + 64, 0)         # 1.25x
+lv.obj_set_style_transform_rotation(btn3, 150, 0)          # 15 deg
+lv.obj_set_style_transform_scale(btn3, 256 + 64, 0)        # 1.25x
 lv.obj_set_style_transform_pivot_x(btn3, 50, 0)
 lv.obj_set_style_transform_pivot_y(btn3, 20, 0)
 lv.obj_set_style_opa(btn3, lv.OPA_50, 0)

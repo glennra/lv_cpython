@@ -1,5 +1,5 @@
 try:
-    import lvgl as lv
+    import lvgl._raw as lv
 except ImportError:
     import os
     import sys
@@ -7,7 +7,7 @@ except ImportError:
     base_path = os.path.dirname(__file__)
     sys.path.insert(0, os.path.abspath(os.path.join(base_path, '..', 'build')))
 
-    import lvgl as lv
+    import lvgl._raw as lv
 
 import time
 
@@ -34,7 +34,7 @@ def sw_event_cb(e, label):
     anim = lv.anim_t()
     lv.anim_init(anim)
     lv.anim_set_var(anim, label)
-    lv.anim_set_time(anim, 500)
+    lv.anim_set_duration(anim, 500)
 
     if lv.obj_has_state(sw, lv.STATE_CHECKED):
         lv.anim_set_values(anim, lv.obj_get_x(label), 100)
@@ -47,15 +47,15 @@ def sw_event_cb(e, label):
     lv.anim_start(anim)
 
 
-label = lv.label_create(lv.scr_act())
+label = lv.label_create(lv.screen_active())
 lv.label_set_text(label, "Hello animations!")
 lv.obj_set_pos(label, 100, 10)
 
 
-sw = lv.switch_create(lv.scr_act())
+sw = lv.switch_create(lv.screen_active())
 lv.obj_center(sw)
 lv.obj_add_state(sw, lv.STATE_CHECKED)
-lv.obj_add_event(sw, lambda e: sw_event_cb(e, label), lv.EVENT_VALUE_CHANGED)
+lv.obj_add_event_cb(sw, lambda e: sw_event_cb(e, label), lv.EVENT_VALUE_CHANGED, None)
 
 
 start = time.time()

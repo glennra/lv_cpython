@@ -5,35 +5,43 @@ import sys
 base_path = os.path.dirname(__file__)
 sys.path.insert(0, os.path.abspath(os.path.join(base_path, '..', 'build')))
 
-import lvgl as lv
+import lvgl._raw as lv
+import lvgl.mpy as lv_mpy
+
+# LVGL 9 naming used by the generated binding.
+lv.style_set_shadow_ofs_x = lv.style_set_shadow_offset_x
+lv.style_set_shadow_ofs_y = lv.style_set_shadow_offset_y
+lv.obj_set_style_shadow_ofs_x = lv.obj_set_style_shadow_offset_x
+lv.obj_set_style_shadow_ofs_y = lv.obj_set_style_shadow_offset_y
+lv.img_create = lv.image_create
+lv.img_set_src = lv.image_set_src
+lv.img_set_zoom = lv.image_set_scale
+lv.img_set_angle = lv.image_set_rotation
+lv.obj_clear_flag = lv.obj_remove_flag
+lv.obj_del = lv.obj_delete
+lv.timer_del = lv.timer_delete
+lv.scr_act = lv.screen_active
+lv.disp_get_default = lv.display_get_default
+lv.disp_get_hor_res = lv.display_get_horizontal_resolution
+lv.disp_get_ver_res = lv.display_get_vertical_resolution
+lv.obj_set_style_img_recolor = lv.obj_set_style_image_recolor
+lv.obj_set_style_img_recolor_opa = lv.obj_set_style_image_recolor_opa
+lv.obj_set_style_transform_angle = lv.obj_set_style_transform_rotation
+lv.PART_TICKS = lv.PART_INDICATOR
+lv.gradient_stop_t = lv.grad_stop_t
 
 
 import math
 import time
 
 
-last_tick = time.time()
-
-
-def tick_cb(_):
-    global last_tick
-
-    curr_tick = time.time()
-    diff = (curr_tick * 1000) - (last_tick * 1000)
-
-    int_diff = int(diff)
-    remainder = diff - int_diff
-
-    curr_tick -= remainder / 1000
-    last_tick = curr_tick
-
-    lv.tick_inc(int_diff)
+def tick_cb():
+    return int(time.monotonic() * 1000)
 
 
 lv.init()
 
-tick_dsc = lv.tick_dsc_t()
-lv.tick_set_cb(tick_dsc, tick_cb)
+lv.tick_set_cb(tick_cb)
 
 disp = lv.sdl_window_create(800, 600)
 group = lv.group_create()
@@ -398,12 +406,10 @@ ui_img_gradient = lv.img_dsc_t(
 )
 
 
-class segmented_display(lv.obj_t):
+class segmented_display(lv_mpy.obj):
 
     def __init__(self, parent):
-        super().__init__()
-        obj = lv.obj_create(parent)
-        obj.cast(self)
+        super().__init__(parent)
 
         self.canvas = lv.canvas_create(self)
 
@@ -596,12 +602,10 @@ def _get_angle(x1, y1, x2, y2):
     return math.degrees(math.atan2(y1 - y2, x1 - x2))
 
 
-class _tick(lv.obj_t):
+class _tick(lv_mpy.obj):
 
     def __init__(self, parent):
-        super().__init__()
-        obj = lv.obj_create(parent)
-        obj.cast(self)
+        super().__init__(parent)
 
         self._points = None
         self._major = False
@@ -701,12 +705,10 @@ class _tick(lv.obj_t):
         return math.degrees(math.atan2(p1.y, p1.x))
 
 
-class knob_ctrl(lv.obj_t):
+class knob_ctrl(lv_mpy.obj):
 
     def __init__(self, parent):
-        super().__init__()
-        obj = lv.obj_create(parent)
-        obj.cast(self)
+        super().__init__(parent)
 
         lv.obj_add_style(self, _style, 0)
         lv.obj_add_flag(self, lv.OBJ_FLAG_OVERFLOW_VISIBLE)
@@ -843,15 +845,17 @@ class knob_ctrl(lv.obj_t):
         lv.obj_set_style_img_recolor(knob_img, lv.color_hex(0x646464), 0)
         lv.obj_set_style_img_recolor_opa(knob_img, 255, 0)
 
-        lv.obj_add_event(
+        lv.obj_add_event_cb(
             knob_glow,
             self.__drag_event_handler,
             lv.EVENT_PRESSING,
+            None,
         )
-        lv.obj_add_event(
+        lv.obj_add_event_cb(
             knob_img,
             self.__drag_event_handler,
             lv.EVENT_PRESSING,
+            None,
         )
         self._captured = False
 
@@ -1249,7 +1253,7 @@ class knob_ctrl(lv.obj_t):
 
         if self._tick_fade:
             if self._fade_timer is None:
-                self._fade_timer = lv.timer_create(self.__tick_fade, 1)
+                self._fade_timer = lv.timer_create(self.__tick_fade, 1, None)
 
         elif self._tick_match_value:
             for i, tick in enumerate(self._ticks):
@@ -1265,7 +1269,7 @@ class knob_ctrl(lv.obj_t):
             self._segmented_display.set_value(int(value))
 
     def __drag_event_handler(self, _):
-        indev = lv.indev_get_act()
+        indev = lv.indev_active()
 
         point = lv.point_t()
         lv.indev_get_point(indev, point)  # NOQA
@@ -1965,7 +1969,8 @@ lv.obj_set_scrollbar_mode(screen, lv.SCROLLBAR_MODE_OFF)
 
 volume = knob_ctrl(screen)
 lv.obj_center(volume)
-volume.set_segment_display(True)
+# The legacy canvas drawing API used by the optional segmented display was
+# removed in LVGL 9. The knob itself remains fully interactive.
 volume.set_size(550, 550)
 
 while True:

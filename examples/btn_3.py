@@ -1,5 +1,5 @@
 try:
-    import lvgl as lv
+    import lvgl._raw as lv
 except ImportError:
     import os
     import sys
@@ -7,7 +7,7 @@ except ImportError:
     base_path = os.path.dirname(__file__)
     sys.path.insert(0, os.path.abspath(os.path.join(base_path, '..', 'build')))
 
-    import lvgl as lv
+    import lvgl._raw as lv
 
 import time
 
@@ -28,7 +28,7 @@ def scroll_event_cb(e):
 
     r = lv.obj_get_height(cont) * 7 // 10
 
-    child_cnt = lv.obj_get_child_cnt(cont)
+    child_cnt = lv.obj_get_child_count(cont)
     for j in range(child_cnt):
         child = lv.obj_get_child(cont, j)
         child_a = lv.area_t()
@@ -63,11 +63,11 @@ def scroll_event_cb(e):
 #
 # Translate the object as they scroll
 #
-cont = lv.obj_create(lv.scr_act())
+cont = lv.obj_create(lv.screen_active())
 lv.obj_set_size(cont, 200, 200)
 lv.obj_center(cont)
 lv.obj_set_flex_flow(cont, lv.FLEX_FLOW_COLUMN)
-lv.obj_add_event(cont, scroll_event_cb, lv.EVENT_SCROLL)
+lv.obj_add_event_cb(cont, scroll_event_cb, lv.EVENT_SCROLL, None)
 lv.obj_set_style_radius(cont, lv.RADIUS_CIRCLE, 0)
 lv.obj_set_style_clip_corner(cont, True, 0)
 lv.obj_set_scroll_dir(cont, lv.DIR_VER)
@@ -77,7 +77,7 @@ lv.obj_set_scrollbar_mode(cont, lv.SCROLLBAR_MODE_OFF)
 
 for i in range(20):
 
-    btn = lv.btn_create(cont)
+    btn = lv.button_create(cont)
     lv.obj_set_width(btn, lv.pct(100))
 
     label = lv.label_create(btn)
@@ -89,7 +89,7 @@ for i in range(20):
     # Be sure the fist button is in the middle
     #lv.obj.scroll_to_view(cont.get_child(0), lv.ANIM.OFF)
     c = lv.obj_get_child(cont, 0)
-    lv.obj_scroll_to_view(c, lv.ANIM_OFF)
+    lv.obj_scroll_to_view(c, False)
 
 
 start = time.time()

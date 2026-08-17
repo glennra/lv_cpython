@@ -1,5 +1,19 @@
 ![image info](./assets/logo_text.png) 
 
+CPython bindings to the LVGL graphics framework updated for LVGL version 9. 
+
+There are two versions of the API, one that somewhat mirrors the C API and one that mirrors the lvl_micropython API. The lvgl_micropython API is now the default.
+
+This version of the bindings is intended to support [MicroPythonOS](https://github.com/MicroPythonOS/MicroPythonOS) and contains a number of bug fixes related to memory management but has no dependency on it.
+
+Developer instructions are in [README-develop.md](README-develop.md).
+
+Currently built against LVGL 9.5.
+
+This update was developed on Linux with assistance from OpenAI Codex. As at v0.1.2 other platforms have not been tested.
+
+
+Original README follows.
 ____________________________
 
 CPython bindings to the LVGL graphics framework.

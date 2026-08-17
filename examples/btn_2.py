@@ -1,5 +1,5 @@
 try:
-    import lvgl as lv
+    import lvgl._raw as lv
 except ImportError:
     import os
     import sys
@@ -7,7 +7,7 @@ except ImportError:
     base_path = os.path.dirname(__file__)
     sys.path.insert(0, os.path.abspath(os.path.join(base_path, '..', 'build')))
 
-    import lvgl as lv
+    import lvgl._raw as lv
 
 import time
 
@@ -40,7 +40,7 @@ lv.style_set_border_color(style, lv.palette_main(lv.PALETTE_GREY))
 
 lv.style_set_shadow_width(style, 8)
 lv.style_set_shadow_color(style, lv.palette_main(lv.PALETTE_GREY))
-lv.style_set_shadow_ofs_y(style, 8)
+lv.style_set_shadow_offset_y(style, 8)
 
 lv.style_set_outline_opa(style, lv.OPA_COVER)
 lv.style_set_outline_color(style, lv.palette_main(lv.PALETTE_BLUE))
@@ -57,18 +57,18 @@ lv.style_set_outline_width(style_pr, 30)
 lv.style_set_outline_opa(style_pr, lv.OPA_TRANSP)
 
 lv.style_set_translate_y(style_pr, 5)
-lv.style_set_shadow_ofs_y(style_pr, 3)
+lv.style_set_shadow_offset_y(style_pr, 3)
 lv.style_set_bg_color(style_pr, lv.palette_darken(lv.PALETTE_BLUE, 2))
 lv.style_set_bg_grad_color(style_pr, lv.palette_darken(lv.PALETTE_BLUE, 4))
 
 # Add a transition to the outline
 trans = lv.style_transition_dsc_t()
 
-lv.style_transition_dsc_init(trans, [lv.STYLE_OUTLINE_WIDTH, lv.STYLE_OUTLINE_OPA, 0], lv.anim_path_linear, 300, 0)
+lv.style_transition_dsc_init(trans, [lv.STYLE_OUTLINE_WIDTH, lv.STYLE_OUTLINE_OPA, 0], lv.anim_path_linear, 300, 0, None)
 
 lv.style_set_transition(style_pr, trans)
 
-btn1 = lv.btn_create(lv.scr_act())
+btn1 = lv.button_create(lv.screen_active())
 lv.obj_remove_style_all(btn1)  # Remove the style coming from the theme
 lv.obj_add_style(btn1, style, 0)
 lv.obj_add_style(btn1, style_pr, lv.STATE_PRESSED)

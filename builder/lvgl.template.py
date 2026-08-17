@@ -7,13 +7,71 @@ except ImportError:
 
 _MPY_API = False
 
+# Keep CFFI allocations and opaque handles returned from Python callbacks
+# alive while LVGL may retain the corresponding C pointer.
+_callback_object_handles = {}
 
-__version__ = "0.1.1b"
+def _make_callback_object_handle(py_obj):
+    # Return a stable void * handle for an arbitrary Python callback result.
+    #
+    # LVGL APIs such as lv_fs_drv_t.open_cb store the returned pointer and
+    # pass it back to later callbacks. ffi.new_handle() provides the opaque
+    # pointer; this registry keeps the handle cdata alive while LVGL owns it.
+    handle = _lib_lvgl.ffi.new_handle(py_obj)
+    key = int(_lib_lvgl.ffi.cast('uintptr_t', handle))
+    _callback_object_handles[key] = handle
+    return handle
+
+
+def _release_callback_object_handle(c_obj):
+    # Release a handle previously created by _make_callback_object_handle().
+    if c_obj is None or c_obj == _lib_lvgl.ffi.NULL:
+        return
+
+    key = int(
+        _lib_lvgl.ffi.cast(
+            'uintptr_t',
+            _lib_lvgl.ffi.cast('void *', c_obj),
+        )
+    )
+    _callback_object_handles.pop(key, None)
+
+
+__version__ = "0.1.2"
 
 
 def binding_version():
     return __version__
 
+def sdl_get_display_size(display_index: int = 0):
+    """Return current SDL display resolution as (width, height)."""
+
+    width = _lib_lvgl.ffi.new('int *')
+    height = _lib_lvgl.ffi.new('int *')
+
+    result = _lib_lvgl.lib.py_sdl_get_display_size(
+        int(display_index),
+        width,
+        height,
+    )
+
+    if result != 0:
+        error = _lib_lvgl.lib.py_sdl_get_error()
+
+        if error == _lib_lvgl.ffi.NULL:
+            message = "unknown SDL error"
+        else:
+            message = _lib_lvgl.ffi.string(error).decode(
+                "utf-8",
+                errors="replace",
+            )
+
+        raise RuntimeError(
+            f"unable to query SDL display {display_index}: "
+            f"{message}"
+        )
+
+    return int(width[0]), int(height[0])
 
 def _get_py_obj(c_obj, c_type):
     if c_type == 'None':
@@ -21,6 +79,35 @@ def _get_py_obj(c_obj, c_type):
 
     if c_obj == _lib_lvgl.ffi.NULL:
         return None
+
+    # CFFI represents scalar char as bytes of length 1.
+    # MicroPython LVGL represents scalar char fields as integer values.
+    if c_type == 'char' and isinstance(c_obj, bytes):
+        if len(c_obj) != 1:
+            raise ValueError(
+                f'expected scalar char, got {len(c_obj)} bytes'
+            )
+        return c_obj[0]
+
+    # The generator currently flattens `const char *` return types to
+    # `char`.  Distinguish an actual C char pointer/array from a scalar
+    # char by inspecting the CFFI object and convert C strings to Python
+    # str.  LVGL strings are UTF-8 and remain owned by LVGL.
+    if c_type == 'char' and not isinstance(
+        c_obj,
+        (int, float, str, bytes),
+    ):
+        try:
+            char_type = _lib_lvgl.ffi.typeof(c_obj)
+
+            if (
+                char_type.kind in ('pointer', 'array')
+                and char_type.item.kind == 'primitive'
+                and char_type.item.cname == 'char'
+            ):
+                return _lib_lvgl.ffi.string(c_obj).decode('utf-8')
+        except (TypeError, AttributeError):  # NOQA
+            pass
 
     if not isinstance(c_obj, (int, float, str, bytes)):
         type_ = _lib_lvgl.ffi.typeof(c_obj)
@@ -44,9 +131,14 @@ def _get_py_obj(c_obj, c_type):
 
     if c_type in glob:
         cls = glob[c_type]
+
         if issubclass(cls, _StructUnion):
-            instance = cls()
-            instance._obj = c_obj  # NOQA
+            cls = _StructUnionMeta.get_wrapper(cls)
+
+            # Object already exists in C. Do not run __init__, which would
+            # allocate another C object.
+            instance = object.__new__(cls)
+            instance._obj = c_obj
             return instance
 
         cls = type(c_type, (cls,), {'_obj': c_obj, '_c_type': c_type + ' *'})
@@ -56,9 +148,14 @@ def _get_py_obj(c_obj, c_type):
 
     if c_type + '_' in glob:
         cls = glob[c_type + '_']
+
         if issubclass(cls, _StructUnion):
-            instance = cls()
-            instance._obj = c_obj  # NOQA
+            cls = _StructUnionMeta.get_wrapper(cls)
+
+            # Object already exists in C. Do not run __init__, which would
+            # allocate another C object.
+            instance = object.__new__(cls)
+            instance._obj = c_obj
             return instance
 
         cls = type(c_type, (cls,), {'_obj': c_obj, '_c_type': c_type + ' *'})
@@ -70,9 +167,6 @@ def _get_py_obj(c_obj, c_type):
         return _convert_basic_type(c_obj, c_type)
 
     if isinstance(c_obj, (int, float)):
-        return _convert_basic_type(c_obj, c_type)
-
-    if isinstance(c_obj, bytes) and c_type == 'char':
         return _convert_basic_type(c_obj, c_type)
 
     if c_type is None:
@@ -93,6 +187,45 @@ def _get_py_obj(c_obj, c_type):
 
     return c_obj
 
+def _make_c_array(py_obj, c_type):
+    if isinstance(py_obj, _Array):
+        return py_obj
+
+    if c_type.startswith('List'):
+        c_type = c_type.split('[', 1)[1][:-1]
+
+    cls = type(
+        f'{c_type}[]',
+        (_Array,),
+        {'_c_type': c_type},
+    )
+
+    instance = cls()
+
+    # Scalar/struct arrays need their Python values converted to wrappers.
+    # Pointer arrays, especially char *[], must remain as Python objects
+    # until _Array materialises their actual pointers.
+    if '*' not in c_type:
+        type_cls = globals()[c_type]
+        py_obj = list(py_obj)
+
+        for i, item in enumerate(py_obj):
+            if hasattr(item, '_obj'):
+                continue
+
+            py_obj[i] = (
+                type_cls(**item)
+                if isinstance(item, dict)
+                else type_cls(item)
+            )
+
+    instance.extend(py_obj)
+
+    # Force materialisation while the owner exists.
+    _ = instance._obj
+
+    return instance
+
 
 def _get_c_obj(py_obj, c_type):
     if isinstance(py_obj, dict):
@@ -101,6 +234,35 @@ def _get_c_obj(py_obj, c_type):
     if py_obj is None:
         return _lib_lvgl.ffi.NULL
 
+    # CFFI does not implicitly convert Python buffer objects to void *.
+    # LVGL APIs such as lv_canvas_set_buffer() accept a raw buffer pointer.
+    # The generator currently reports void * parameters as 'None', so also
+    # accept that spelling here until pointer depth is preserved by the
+    # generator.
+    if (
+        c_type in ('None', 'Any', 'void', 'void *')
+        and isinstance(py_obj, (bytes, bytearray, memoryview))
+    ):
+        return _lib_lvgl.ffi.from_buffer(py_obj)
+
+    if c_type == 'char':
+        # Scalar C char. MicroPython API commonly supplies ord(...).
+        if isinstance(py_obj, int):
+            if not 0 <= py_obj <= 255:
+                raise ValueError(
+                    f'char integer must be in range 0..255, got {py_obj}'
+                )
+
+            return bytes((py_obj,))
+
+        # The generator currently also reports char * as "char".
+        # Strings therefore must not be restricted to one byte.
+        if isinstance(py_obj, str):
+            return py_obj.encode('utf-8')
+
+        if isinstance(py_obj, (bytes, bytearray)):
+            return bytes(py_obj)
+
     if hasattr(py_obj, '_obj'):
         return py_obj._obj  # NOQA
 
@@ -108,25 +270,7 @@ def _get_c_obj(py_obj, c_type):
         globs = globals()
 
         if c_type.startswith('List'):
-            c_type = c_type.split('[')[-1][:-1]
-            cls = type(f'{c_type}[]', (_Array,), {'_c_type': c_type})
-            instance = cls()
-
-            type_cls = globs[c_type]
-
-            for i, item in enumerate(py_obj):
-                if hasattr(item, '_obj'):
-                    continue
-
-                item_inst = (
-                    type_cls(**item) if isinstance(item, dict)
-                    else type_cls(item)
-                )
-                py_obj[i] = item_inst
-
-            instance.extend(py_obj)
-
-            return instance._obj  # NOQA
+            return _make_c_array(py_obj, c_type)._obj
 
         def _instance(_c_type):
             c = globs[_c_type]
@@ -192,6 +336,146 @@ class va_list(list):
 class _DefaultArg:
     pass
 
+class _CallbackPointer:
+    def __init__(self, c_obj, c_type='void'):
+        self._obj = c_obj
+        self._c_type = c_type
+
+    def __cast__(self):
+        """Recover a Python object stored using ffi.new_handle()."""
+        return _lib_lvgl.ffi.from_handle(
+            _lib_lvgl.ffi.cast('void *', self._obj)
+        )
+
+    def __dereference__(self, size=None):
+        """Expose pointed memory using MicroPython LVGL semantics."""
+        if size is None:
+            try:
+                return _get_py_obj(self._obj[0], self._c_type)
+            except Exception:
+                size = _lib_lvgl.ffi.sizeof(
+                    _lib_lvgl.ffi.typeof(self._obj).item
+                )
+
+        return _lib_lvgl.ffi.buffer(
+            _lib_lvgl.ffi.cast('char *', self._obj),
+            size
+        )
+
+class _CallbackScalarPointer:
+    """MicroPython-compatible wrapper for scalar T * callback arguments."""
+
+    def __init__(self, c_obj, c_type):
+        self._obj = c_obj
+        self._c_type = c_type
+
+    def __dereference__(self, size=None):
+        """Dereference using MicroPython LVGL pointer semantics.
+
+        With no size, return the scalar value.
+
+        With an explicit size, return a writable byte view of the
+        pointed-to memory.
+        """
+        if size is None:
+            return _get_py_obj(
+                self._obj[0],
+                self._c_type,
+            )
+
+        return _lib_lvgl.ffi.buffer(
+            _lib_lvgl.ffi.cast('char *', self._obj),
+            size,
+        )
+
+    def __getitem__(self, index):
+        return _get_py_obj(
+            self._obj[index],
+            self._c_type,
+        )
+
+    def __setitem__(self, index, value):
+        self._obj[index] = _get_c_obj(
+            value,
+            self._c_type,
+        )        
+    
+def _get_py_callback_ptr(c_obj, c_type):
+    if c_obj == _lib_lvgl.ffi.NULL:
+        return None
+
+    try:
+        ffi_type = _lib_lvgl.ffi.typeof(c_obj)
+    except TypeError:
+        return _get_py_obj(c_obj, c_type)
+
+    if ffi_type.kind != 'pointer':
+        return _get_py_obj(c_obj, c_type)
+
+    # Struct/union pointers retain the normal LVGL wrapper behaviour.
+    if ffi_type.item.kind in ('struct', 'union'):
+        return _get_py_obj(c_obj, c_type)
+
+    # char * represents a C string.
+    if (
+        ffi_type.item.kind == 'primitive'
+        and ffi_type.item.cname == 'char'
+    ):
+        return _get_py_obj(c_obj, 'char')
+
+    if ffi_type.item.kind == 'primitive':
+        return _CallbackScalarPointer(c_obj, c_type)
+
+    # void * and untyped buffers.
+    return _CallbackPointer(c_obj, c_type)
+
+
+_callback_return_refs = {}
+
+def _get_callback_return(py_obj, c_type, is_pointer):
+    if py_obj is None:
+        if is_pointer:
+            return _lib_lvgl.ffi.NULL
+        return None
+
+    if not is_pointer:
+        return _get_c_obj(py_obj, c_type)
+
+    # Already wrapped C object/pointer.
+    if hasattr(py_obj, '_obj'):
+        return py_obj._obj
+
+    # C string returned as pointer.
+    if isinstance(py_obj, str):
+        data = py_obj.encode('utf-8')
+        ref = _lib_lvgl.ffi.new('char[]', data)
+
+        key = id(ref)
+        _callback_object_handles[key] = ref
+        return ref
+
+    # Raw buffers returned as pointers.
+    if isinstance(py_obj, (bytearray, memoryview)):
+        ref = _lib_lvgl.ffi.from_buffer(py_obj)
+
+        key = id(ref)
+        _callback_object_handles[key] = (py_obj, ref)
+        return ref
+
+    if isinstance(py_obj, bytes):
+        ref = _lib_lvgl.ffi.new('char[]', py_obj)
+
+        key = id(ref)
+        _callback_object_handles[key] = ref
+        return ref
+
+    # MicroPython binding permits arbitrary Python objects to cross a
+    # void * callback boundary.  Represent those with a CFFI handle.
+    if c_type in ('void', 'Any', 'None'):
+        return _make_callback_object_handle(py_obj)
+
+    return _get_c_obj(py_obj, c_type)
+    
 
 class _AsArrayMixin:
     _c_type = ''
@@ -224,10 +508,40 @@ class _Array(list):
             dim = self._dim
 
             for item in self._array:
+                # Pointer arrays need different treatment from arrays of
+                # scalar/struct values. In particular LVGL APIs such as
+                # lv_keyboard_set_map() take `const char * const map[]`.
+                if '*' in self._c_type:
+                    if item is None:
+                        c_array.append(_lib_lvgl.ffi.NULL)
 
-                c_obj = _get_c_obj(item, self._c_type)
-                py_obj = _get_py_obj(c_obj, self._c_type)
-                c_array.append(py_obj.as_dict())
+                    elif (
+                        self._c_type.replace('const', '').strip() == 'char *'
+                        and isinstance(item, (str, bytes, bytearray))
+                    ):
+                        if isinstance(item, str):
+                            item = item.encode('utf-8')
+                        else:
+                            item = bytes(item)
+
+                        # ffi.new("char[]", bytes) adds terminating NUL.
+                        ref = _lib_lvgl.ffi.new('char[]', item)
+                        self.__refs.append(ref)
+                        c_array.append(ref)
+
+                    else:
+                        c_array.append(_get_c_obj(item, self._c_type))
+
+                else:
+                    c_obj = _get_c_obj(item, self._c_type)
+                    py_obj = _get_py_obj(c_obj, self._c_type)
+
+                    if hasattr(py_obj, 'as_dict'):
+                        c_array.append(py_obj.as_dict())
+                    else:
+                        # Scalar C array element.
+                        c_array.append(c_obj)
+
                 if isinstance(item, _Array):
                     dim += item._dim
 
@@ -303,6 +617,12 @@ class _Array(list):
 
     def __init__(self):
         self.__obj = None
+
+        # Keep backing allocations for pointer-array elements alive for as
+        # long as the C array exists (e.g. char[] strings referenced by
+        # char *[]).
+        self.__refs = []
+
         self._array = []
         list.__init__(self)
 
@@ -512,6 +832,13 @@ class _Array(list):
                 return
 
         except AttributeError:
+            # Pointer arrays retain Python values until `_obj` is
+            # materialized. `_obj` then converts None to NULL, strings to
+            # stable char[] allocations, and wrappers to C pointers.
+            if '*' in self._c_type:
+                self._array.append(py_obj)
+                return
+
             if isinstance(py_obj, (int, str, float, bytes, bool)):
                 py_type = _convert_basic_type(py_obj, self._c_type)
                 self._array.append(py_type)
@@ -742,12 +1069,7 @@ class size_t(_Integer):
 # the mpy module. The reason why this meta class exists is so that objects
 # comming from C code get redirected to those wrapper classes instead of to
 # the C API classes. If the redirection does not occur then the methods in
-# the wraapper classes would not be accessable.
-# This class checks to see if wrapper classes are being used by
-# the mpy module. The reason why this meta class exists is so that objects
-# comming from C code get redirected to those wrapper classes instead of to
-# the C API classes. If the redirection does not occur then the methods in
-# the wraapper classes would not be accessable.
+# the wrapper classes would not be accessible.
 class _StructUnionMeta(type):
     _wrapped_classes = {}
     _classes = {}
@@ -756,26 +1078,60 @@ class _StructUnionMeta(type):
     def __init__(cls, name, bases, dct):
         super().__init__(name, bases, dct)
 
-        if '.mpy.' in str(bases[0]) or f'lvgl.{name}' in str(bases[0]):
-            if name not in _StructUnionMeta._wrapped_classes:
-                _StructUnionMeta._wrapped_classes[name] = cls
+        # Only classes generated in lvgl.mpy are wrappers.
+        # Raw classes now live in lvgl._raw.
+        if cls.__module__.endswith('.mpy'):
+            _StructUnionMeta._wrapped_classes.setdefault(name, cls)
 
-    def __call__(cls, *args, **kwargs):
+    @staticmethod
+    def get_wrapper(cls):
         name = cls.__name__
 
+        if cls.__module__.endswith('mpy'):
+            return cls
+
+        wrapped = _StructUnionMeta._wrapped_classes
+
+        if name.endswith('_t') and name[:-2] in wrapped:
+            return wrapped[name[:-2]]
+
+        if name.startswith('_') and name[1:] in wrapped:
+            return wrapped[name[1:]]
+
+        if name in wrapped:
+            return wrapped[name]
+
+        return cls
+
+    def __call__(cls, *args, **kwargs):
+        # MicroPython LVGL struct syntax:
+        #
+        #     lv.image_dsc_t({
+        #         "data_size": 123,
+        #         "data": buffer,
+        #     })
+        #
+        if len(args) == 1 and isinstance(args[0], dict):
+            if kwargs:
+                raise TypeError(
+                    "cannot combine dict initializer with keyword arguments"
+                )
+
+            kwargs = dict(args[0])
+            args = ()
+
         if not _StructUnionMeta._calling_from_meta:
-            if not cls.__module__.endswith('mpy'):
-                if name.endswith('_t') and name[:-2] in _StructUnionMeta._wrapped_classes:
-                    cls = _StructUnionMeta._wrapped_classes[name[:-2]]  # NOQA
-                elif name.startswith('_') and name[1:] in _StructUnionMeta._wrapped_classes:
-                    cls = _StructUnionMeta._wrapped_classes[name[1:]]  # NOQA
-                elif name in _StructUnionMeta._wrapped_classes:
-                    cls = _StructUnionMeta._wrapped_classes[name]  # NOQA
+            cls = _StructUnionMeta.get_wrapper(cls)
 
         _StructUnionMeta._calling_from_meta = True
-        instance = super(_StructUnionMeta, cls).__call__(*args, **kwargs)
-        _StructUnionMeta._calling_from_meta = False
-        return instance
+
+        try:
+            return super(_StructUnionMeta, cls).__call__(
+                *args,
+                **kwargs,
+            )
+        finally:
+            _StructUnionMeta._calling_from_meta = False
 
 
 class _StructUnion(_AsArrayMixin, metaclass=_StructUnionMeta):
@@ -824,19 +1180,96 @@ class _StructUnion(_AsArrayMixin, metaclass=_StructUnionMeta):
             self.__dict__['__py_{0}__'.format(field_name)] = py_obj
             self.__dict__['__c_{0}__'.format(field_name)] = c_obj
 
-
         if isinstance(py_obj, list):
             c_obj = [item.as_dict() for item in py_obj]
             _setattr()
             return
 
-        c_obj = _get_c_obj(py_obj, c_type)
-        if isinstance(c_obj, bytes):
-            c_obj = _lib_lvgl.ffi.from_buffer(
-                c_type.split(' ')[0] + f'[{len(c_obj)}]', bytearray(c_obj)
+        # The generated Python type can lose pointer information, so inspect
+        # the destination field's real CFFI type.
+        try:
+            field_type = _lib_lvgl.ffi.typeof(
+                getattr(self._obj, field_name)
+            )
+        except (AttributeError, TypeError):
+            field_type = None
+
+        # Python str -> retained NUL-terminated storage for string pointers.
+        if (
+            isinstance(py_obj, str)
+            and field_type is not None
+            and field_type.kind == 'pointer'
+            and (
+                field_type.item.kind == 'void'
+                or (
+                    field_type.item.kind == 'primitive'
+                    and field_type.item.cname == 'char'
+                )
+            )
+        ):
+            c_obj = _lib_lvgl.ffi.new(
+                'char[]',
+                py_obj.encode('utf-8'),
             )
 
+            _setattr()
+            return
+
+        # bytes/bytearray/memoryview -> primitive C pointer.
+        #
+        # This covers e.g. lv_image_dsc_t.data, whose generated Python type
+        # can say "uint8_t" even though the real field is uint8_t *.
+        if (
+            isinstance(py_obj, (bytes, bytearray, memoryview))
+            and field_type is not None
+            and field_type.kind == 'pointer'
+            and field_type.item.kind == 'primitive'
+        ):
+            if isinstance(py_obj, bytes):
+                backing = bytearray(py_obj)
+            elif isinstance(py_obj, memoryview) and py_obj.readonly:
+                backing = bytearray(py_obj)
+            else:
+                backing = py_obj
+
+            try:
+                buffer_obj = _lib_lvgl.ffi.from_buffer(backing)
+            except (TypeError, BufferError):
+                backing = bytearray(py_obj)
+                buffer_obj = _lib_lvgl.ffi.from_buffer(backing)
+
+            c_obj = _lib_lvgl.ffi.cast(
+                field_type.cname,
+                buffer_obj,
+            )
+
+            # Keep both the Python buffer and CFFI view alive.
+            self.__dict__[
+                '__buffer_{0}__'.format(field_name)
+            ] = backing
+
+            _setattr()
+            return
+
+        c_obj = _get_c_obj(py_obj, c_type)
+
+        # Struct wrappers own T *, whereas embedded struct fields require T.
+        try:
+            src_type = _lib_lvgl.ffi.typeof(c_obj)
+
+            if (
+                field_type is not None
+                and field_type.kind in ('struct', 'union')
+                and src_type.kind == 'pointer'
+                and src_type.item.kind in ('struct', 'union')
+            ):
+                c_obj = c_obj[0]
+
+        except TypeError:
+            pass
+
         _setattr()
+
 
     def as_dict(self):
         res = {}
@@ -848,3 +1281,4 @@ class _StructUnion(_AsArrayMixin, metaclass=_StructUnionMeta):
 
 _PY_C_TYPES = (_Float, _Integer, _String, _StructUnion)
 _global_cb_store = _CBStore()
+_global_cb_handles = set()

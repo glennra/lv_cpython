@@ -1,5 +1,5 @@
 try:
-    import lvgl as lv
+    import lvgl._raw as lv
 except ImportError:
     import os
     import sys
@@ -7,7 +7,7 @@ except ImportError:
     base_path = os.path.dirname(__file__)
     sys.path.insert(0, os.path.abspath(os.path.join(base_path, '..', 'build')))
 
-    import lvgl as lv
+    import lvgl._raw as lv
 
 import time
 
@@ -31,7 +31,7 @@ def anim_size(a, v):
 #
 # Create a playback animation
 #
-obj = lv.obj_create(lv.scr_act())
+obj = lv.obj_create(lv.screen_active())
 lv.obj_set_style_bg_color(obj, lv.palette_main(lv.PALETTE_RED), 0)
 lv.obj_set_style_radius(obj, lv.RADIUS_CIRCLE, 0)
 
@@ -41,9 +41,9 @@ a1 = lv.anim_t()
 lv.anim_init(a1)
 lv.anim_set_var(a1, obj)
 lv.anim_set_values(a1, 10, 50)
-lv.anim_set_time(a1, 1000)
-lv.anim_set_playback_delay(a1, 100)
-lv.anim_set_playback_time(a1, 300)
+lv.anim_set_duration(a1, 1000)
+lv.anim_set_reverse_delay(a1, 100)
+lv.anim_set_reverse_duration(a1, 300)
 lv.anim_set_repeat_delay(a1, 500)
 lv.anim_set_repeat_count(a1, lv.ANIM_REPEAT_INFINITE)
 lv.anim_set_path_cb(a1, lv.anim_path_ease_in_out)
@@ -54,9 +54,9 @@ a2 = lv.anim_t()
 lv.anim_init(a2)
 lv.anim_set_var(a2, obj)
 lv.anim_set_values(a2, 10, 240)
-lv.anim_set_time(a2, 1000)
-lv.anim_set_playback_delay(a2, 100)
-lv.anim_set_playback_time(a2, 300)
+lv.anim_set_duration(a2, 1000)
+lv.anim_set_reverse_delay(a2, 100)
+lv.anim_set_reverse_duration(a2, 300)
 lv.anim_set_repeat_delay(a2, 500)
 lv.anim_set_repeat_count(a2, lv.ANIM_REPEAT_INFINITE)
 lv.anim_set_path_cb(a2, lv.anim_path_ease_in_out)
@@ -72,4 +72,3 @@ while True:
     start = stop
     lv.tick_inc(diff)
     lv.task_handler()
-

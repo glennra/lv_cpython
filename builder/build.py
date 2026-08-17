@@ -11,6 +11,7 @@ from . import mpy_builder
 
 class build(_build):
     ast = None
+    model = None
     sdl2_dll = None
     extra_includes = []
 
@@ -25,13 +26,40 @@ class build(_build):
         self.distribution.include_dirs = self.extra_includes
 
     def run(self):
-        _build.run(self)
+        generated = False
+
+        # build_py must populate build_lib before we replace the checked-in
+        # generated files there.  Generate immediately afterwards, before
+        # build_ext compiles the native extension.
+        for command_name in self.get_sub_commands():
+            if command_name == 'build_ext':
+                self._generate_bindings()
+                generated = True
+
+            self.run_command(command_name)
+
+        # Keep this command useful for distributions without an extension
+        # subcommand as well.
+        if not generated:
+            self._generate_bindings()
+
+        self._relocate_windows_extension()
+
+    def _generate_bindings(self):
+        lvgl_output_path = os.path.join(self.build_lib, 'lvgl')
+        os.makedirs(lvgl_output_path, exist_ok=True)
+
+        py_builder.run(lvgl_output_path, self.model)
+        mpy_builder.run(self.build_lib, self.model)
+
+    def _relocate_windows_extension(self):
+        """Place Windows build products beside the Python package.
+
+        This relocation remains necessary for the installed package layout;
+        generation no longer depends on it.
+        """
 
         lvgl_output_path = os.path.join(self.build_lib, 'lvgl')
-        if not os.path.exists(lvgl_output_path):
-            os.mkdir(lvgl_output_path)
-
-        py_builder.run(lvgl_output_path, self.ast)
 
         for file in os.listdir(self.build_lib):
             if file.endswith('pyd') or file.endswith('pdb'):
@@ -50,5 +78,3 @@ class build(_build):
                 os.remove(dst)
 
             shutil.copyfile(self.sdl2_dll, dst)
-
-        mpy_builder.run(self.build_lib)

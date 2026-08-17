@@ -1,5 +1,5 @@
 try:
-    import lvgl as lv
+    import lvgl._raw as lv
 except ImportError:
     import os
     import sys
@@ -7,33 +7,18 @@ except ImportError:
     base_path = os.path.dirname(__file__)
     sys.path.insert(0, os.path.abspath(os.path.join(base_path, '..', 'build')))
 
-    import lvgl as lv
+    import lvgl._raw as lv
 
 import time
 
 
-last_tick = time.time()
-
-
-def tick_cb(_):
-    global last_tick
-
-    curr_tick = time.time()
-    diff = (curr_tick * 1000) - (last_tick * 1000)
-
-    int_diff = int(diff)
-    remainder = diff - int_diff
-
-    curr_tick -= remainder / 1000
-    last_tick = curr_tick
-
-    lv.tick_inc(int_diff)
+def tick_cb():
+    return int(time.monotonic() * 1000)
 
 
 lv.init()
 
-tick_dsc = lv.tick_dsc_t()
-lv.tick_set_cb(tick_dsc, tick_cb)
+lv.tick_set_cb(tick_cb)
 
 disp = lv.sdl_window_create(480, 320)
 group = lv.group_create()
@@ -42,7 +27,7 @@ mouse = lv.sdl_mouse_create()
 keyboard = lv.sdl_keyboard_create()
 lv.indev_set_group(keyboard, group)
 
-lv.demo_benchmark(1)
+lv.demo_benchmark()
 
 #
 #

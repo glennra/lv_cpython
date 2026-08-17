@@ -1,5 +1,5 @@
 try:
-    import lvgl as lv
+    import lvgl._raw as lv
 except ImportError:
     import os
     import sys
@@ -7,7 +7,7 @@ except ImportError:
     base_path = os.path.dirname(__file__)
     sys.path.insert(0, os.path.abspath(os.path.join(base_path, '..', 'build')))
 
-    import lvgl as lv
+    import lvgl._raw as lv
 
 import time
 
@@ -28,13 +28,13 @@ def slider_event_cb(e):
 
 
 # Create a slider in the center of the display
-slider = lv.slider_create(lv.scr_act())
+slider = lv.slider_create(lv.screen_active())
 lv.obj_set_width(slider, 200)
 lv.obj_center(slider)
-lv.obj_add_event(slider, slider_event_cb, lv.EVENT_VALUE_CHANGED)
+lv.obj_add_event_cb(slider, slider_event_cb, lv.EVENT_VALUE_CHANGED, None)
 
 # Create a label above the slider
-label = lv.label_create(lv.scr_act())
+label = lv.label_create(lv.screen_active())
 lv.label_set_text(label, "0")
 lv.obj_align_to(label, slider, lv.ALIGN_OUT_TOP_MID, 0, -15)
 

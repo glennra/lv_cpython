@@ -2,12 +2,20 @@
 
 import os
 import sys
+import keyword
 from pycparser import c_generator  # NOQA
 
 from . import utils
+from .binding_model import BindingModel
 
 
 generator = c_generator.CGenerator()
+py_globals = []
+py_global_names = []
+
+def get_py_name(name):
+    """Return a valid Python identifier for a name originating in C."""
+    return name + '_' if keyword.iskeyword(name) else name
 
 
 def get_py_type(name):
@@ -27,7 +35,8 @@ def get_py_type(name):
 
     return (
         None if name.startswith('void') else
-        'Float' if name.startswith('float') else
+        '_Bool' if name == 'bool' else
+        '_Float' if name.startswith('float') else
         'int_' if name.split(' ')[0] == 'int' else
         f'"{name}"'
     )
@@ -49,10 +58,33 @@ def format_name(name):
         if name.startswith('LV_'):
             name = name[3:]
 
+        if name and name[0].isdigit():
+            name = f'type_{name}'
+
         if private:
             name = f'_{name}'
 
     return name
+
+# LVGL 9.4's lv_fs_drv_t callbacks are anonymous function-pointer members.
+# Give them deterministic synthetic callback typedef names so they can use
+# the same callback machinery as normal *_cb_t typedefs.
+_ANONYMOUS_CALLBACK_STRUCTS = {'_lv_fs_drv_t'}
+
+
+def get_anonymous_struct_callback_name(struct_name, field_name):
+    if (
+        struct_name not in _ANONYMOUS_CALLBACK_STRUCTS
+        or not field_name
+    ):
+        return None
+
+    struct_name = struct_name.lstrip('_')
+    if struct_name.endswith('_t'):
+        struct_name = struct_name[:-2]
+
+    # _lv_fs_drv_t + open_cb -> lv_fs_drv_open_cb_t
+    return f'{struct_name}_{field_name}_t'
 
 
 class Decl:
@@ -277,6 +309,7 @@ class TypeDecl:
 
         if isinstance(self.type, Enum):
             name, type_, code = self.type.gen_py()
+            enum_name = name
 
             if '{type}' in code:
                 if declname:
@@ -291,8 +324,30 @@ class TypeDecl:
                 else:
                     raise RuntimeError
 
-            type_ = name
-            name = declname
+            # Enum tags are not emitted as Python classes. Typedefs must
+            # therefore inherit from the integer wrapper, not from the C tag
+            # name (for example ``enum _lvimage_flags_t``).
+            type_ = 'int_'
+            name = declname or enum_name
+            if not declname and name and name.startswith('_'):
+                name = name[1:]
+
+            if name and name not in py_int_type_names:
+                py_int_type_names.append(name)
+                py_int_types.append(
+                    'class {0}(int_):\n    pass\n'.format(name)
+                )
+
+            # A typedef of an anonymous enum has no enum tag to use as its
+            # Python base class.  Treat it as an integer type so the class is
+            # emitted before its enumerator constants.
+            if name and type_ is None:
+                if name not in py_int_type_names:
+                    py_int_type_names.append(name)
+                    py_int_types.append(
+                        'class {0}(int_):\n    pass\n'.format(name)
+                    )
+                type_ = name
 
             if name and type_ and name != type_ and name not in int_types:
                 int_types[name] = type_
@@ -347,6 +402,35 @@ class EllipsisParam:
     def __init__(self, **_):
         pass
 
+def get_param_conversion_type(param, py_type):
+    """Return C-oriented type string used by _get_c_obj().
+
+    Python annotations may flatten pointer arrays to List[T], but conversion
+    needs pointer depth, e.g. const char *map[] -> List[char *].
+    """
+    type_ = getattr(param, 'type', None)
+
+    if isinstance(type_, ArrayDecl):
+        element = type_.type
+        pointer_depth = 0
+
+        while isinstance(element, PtrDecl):
+            pointer_depth += 1
+            element = element.type
+
+        if pointer_depth:
+            if isinstance(element, TypeDecl):
+                _, base_type, _ = element.gen_py()
+
+                if base_type in (None, 'None'):
+                    base_type = 'void'
+
+                base_type = base_type.replace('"', '')
+
+                stars = '*' * pointer_depth
+                return f'List[{base_type} {stars}]'
+
+    return py_type.replace('"', '')
 
 class FuncDecl:
     param_template = '{param_name}: {param_type}'
@@ -382,25 +466,28 @@ def {func_name}({params}) -> {ret_type}:{callback_code}
 
     callback_code_user_data_param_template = '''\
     cb_store = _global_cb_store
-    if '{cb_type}.{func_name}' in cb_store:
-        store = cb_store['{cb_type}.{func_name}']
-        if {param_name} in store:
-            del store[{param_name}]
-    else:
-        store = _CBStore()
-        cb_store['{cb_type}.{func_name}'] = store
 
-    cb_store_handle = _lib_lvgl.ffi.new_handle(store)    
+    store = _CBStore()
+    cb_store_handle = _lib_lvgl.ffi.new_handle(store)
     c_func = getattr(_lib_lvgl.lib, 'py_{full_cb_type}')
-    store[{param_name}] = cb_store_handle
+
     store['{cb_type}'] = {param_name}
     store['{cb_type}.c_func'] = c_func
+    store['__handle__'] = cb_store_handle
+    store['user_data'] = user_data
 
-    cb_store['{cb_type}.{func_name}'] = store
+    # Keep registration-specific store and handle alive.
+    cb_store[id(store)] = store
+
     {param_name} = c_func
-    
-    cb_store['user_data'] = user_data
     user_data = cb_store_handle'''
+
+    callback_code_global_template = '''\
+    cb_store = _global_cb_store
+    cb_store['{cb_type}'] = {param_name}
+
+    {param_name} = getattr(_lib_lvgl.lib, 'py_{full_cb_type}')
+    cb_store['{cb_type}.c_func'] = {param_name}'''
 
     def __init__(self, args, type):  # NOQA
         self.args = args
@@ -418,7 +505,7 @@ def {func_name}({params}) -> {ret_type}:{callback_code}
         return self.args[item]
 
     def gen_py(self):
-        args = self.args or []
+        args = list(self.args or [])
 
         if isinstance(self.type, (TypeDecl, PtrDecl)):
             name, type_, code = self.type.gen_py()
@@ -501,7 +588,10 @@ def {func_name}({params}) -> {ret_type}:{callback_code}
                 param_conversions.append(
                     self.param_conv_template.format(
                         param_name=param_name,
-                        param_type=p_type.replace('"', '')
+                        param_type=get_param_conversion_type(
+                            param,
+                            p_type,
+                        )
                     )
                 )
 
@@ -517,6 +607,11 @@ def {func_name}({params}) -> {ret_type}:{callback_code}
             callback_format_params['func_name'] = declname
 
             callback_code = self.callback_code_user_data_param_template.format(
+                **callback_format_params
+            )
+        elif len(args) == 1:
+            callback_format_params['func_name'] = declname
+            callback_code = self.callback_code_global_template.format(
                 **callback_format_params
             )
         else:
@@ -628,14 +723,14 @@ class Struct:
     @property
     def {field_name}(self) -> {field_type}:
         return self._get_field(
-            '{field_name}', 
+            '{c_field_name}', 
             '{c_type}'
         )
 
     @{field_name}.setter
     def {field_name}(self, value: {field_type}):
         self._set_field(
-            '{field_name}', 
+            '{c_field_name}', 
             value, 
             '{c_type}'
         )'''
@@ -648,8 +743,16 @@ class Struct:
                 cb_store_handle = self._obj.user_data
                 cb_store = _lib_lvgl.ffi.from_handle(cb_store_handle)
             except:  # NOQA
+                # cb_store = _CBStore()
+                # cb_store_handle = _lib_lvgl.ffi.new_handle(cb_store)
+                # self._obj.user_data = cb_store_handle
                 cb_store = _CBStore()
                 cb_store_handle = _lib_lvgl.ffi.new_handle(cb_store)
+
+                # C structures such as lv_anim_t can be copied by LVGL while retaining
+                # user_data. Keep the original ffi.new_handle() cdata alive independently
+                # of the Python wrapper object.
+                _global_cb_handles.add(cb_store_handle)
                 self._obj.user_data = cb_store_handle
 
             self.__dict__['__cb_store__'] = cb_store
@@ -676,20 +779,20 @@ class Struct:
         _ = self.user_data
         
         cb_store = self.__dict__['__cb_store__']
-        return cb_store.get('{field_type}', None)
+        return cb_store.get('{cb_key}', None)
 
     @{field_name}.setter
     def {field_name}(self, value: {field_type}):
         _ = self.user_data
         cb_store = self.__dict__['__cb_store__']
 
-        if '{field_type}' not in cb_store:
-            cb_store['{field_type}'] = value
+        if '{cb_key}' not in cb_store:
+            cb_store['{cb_key}'] = value
             c_func = getattr(_lib_lvgl.lib, 'py_{full_field_type}')
-            cb_store['{field_type}.c_func'] = c_func
-            self._obj.{field_name} = c_func
+            cb_store['{cb_key}.c_func'] = c_func
+            setattr(self._obj, '{c_field_name}', c_func)
         else:
-            cb_store['{field_type}'] = value'''
+            cb_store['{cb_key}'] = value'''
 
     int_param_template = (
         '{field_name}: Optional[{field_type}] = 0'
@@ -726,7 +829,16 @@ class {struct_name}(_StructUnion): {nested_structs}
         param_names = []
 
         if self.decls is None:
-            return None, s_name, None
+            c_type = (
+                'None' if self.name is None else
+                self.name[1:] if self.name.startswith('_') else
+                self.name
+            )
+            code = (
+                f'class {s_name}(_StructUnion):\n'
+                f"    _c_type = '{c_type} *'\n"
+            )
+            return s_name, None, code
 
         for field in self.decls:
             if isinstance(field, Decl):
@@ -734,12 +846,36 @@ class {struct_name}(_StructUnion): {nested_structs}
                 full_field_type = None
 
                 if isinstance(field.type, PtrDecl):
-                    if code and code.startswith('def '):
-                        if isinstance(field.type.type, FuncDecl):
+                    if (
+                            code and
+                            code.startswith('def ') and
+                            isinstance(field.type.type, FuncDecl)
+                    ):
+                        full_field_type = get_anonymous_struct_callback_name(
+                            self.name,
+                            field.name,
+                        )
+
+                        if full_field_type is None:
                             continue
+
+                        # Feed the anonymous member through the normal
+                        # function-pointer typedef callback generator.
+                        RootTypedef(
+                            full_field_type,
+                            [],
+                            [],
+                            field.type,
+                        ).gen_py()
+
+                        type_ = '"{0}"'.format(
+                            format_name(full_field_type)
+                        )
+                        code = None
 
                 elif isinstance(field.type, TypeDecl):
                     if isinstance(field.type.type, (Union, Struct)) and code:
+                        nested_name = type_ or name
                         code = (
                             '\n'.join(
                                 f'    {line}'
@@ -747,17 +883,24 @@ class {struct_name}(_StructUnion): {nested_structs}
                             )
                         )
 
-                        code = code.replace(name, f'_{name}')
+                        code = code.replace(
+                            f'class {nested_name}',
+                            f'class _{nested_name}',
+                            1
+                        )
 
                         nested_structs.append(code)
                         # field_names.append(name)
                         param_names.append(f'{name}={name}')
-                        params.append(f'{name}: Optional[_{name}] = None')
+                        params.append(
+                            f'{name}: Optional["_{nested_name}"] = _DefaultArg'
+                        )
 
                         py_properties.append(
                             self.property_template.format(
                                 field_name=name,
-                                field_type=f'_{name}',
+                                c_field_name=name,
+                                field_type=f'"_{nested_name}"',
                                 c_type=''
                             )
                         )
@@ -773,6 +916,9 @@ class {struct_name}(_StructUnion): {nested_structs}
                 if not name:
                     raise RuntimeError(f'{repr(type_)} : {repr(code)}')
 
+                c_name = name
+                name = get_py_name(name)
+
                 if type_ in (None, 'None'):
                     type_ = 'Any'
 
@@ -784,7 +930,10 @@ class {struct_name}(_StructUnion): {nested_structs}
                     if '"' not in type_:
                         type_ = '"' + type_ + '"'
 
-                param_names.append(name + '=' + name)
+                if c_name == name:
+                    param_names.append(name + '=' + name)
+                else:
+                    param_names.append(f"**{{'{c_name}': {name}}}")
 
                 for item in ('_cb_t', '_f_t'):
                     if item not in type_:
@@ -793,7 +942,9 @@ class {struct_name}(_StructUnion): {nested_structs}
                     py_properties.append(
                         self.callback_property_template.format(
                             field_name=name,
+                            c_field_name=c_name,
                             field_type=type_,
+                            cb_key=type_.replace('"', ''),
                             full_field_type=full_field_type
                         )
                     )
@@ -814,14 +965,24 @@ class {struct_name}(_StructUnion): {nested_structs}
                         py_properties.append(
                             self.property_template.format(
                                 field_name=name,
+                                c_field_name=c_name,
                                 field_type=type_,
                                 c_type=type_.replace('"', '')
                                 if type_ != 'Any'
                                 else 'void'
                             )
                         )
+                    if isinstance(field.type, PtrDecl):
+                        # Pointer fields are already NULL after ffi.new().
+                        # Do not try assigning integer 0 to a CFFI pointer.
+                        params.append(
+                            self.param_template.format(
+                                field_name=name,
+                                field_type=type_
+                            )
+                        )
 
-                    if str(type_) == 'bool':
+                    elif str(type_) == 'bool':
                         params.append(
                             self.bool_param_template.format(
                                 field_name=name,
@@ -981,6 +1142,12 @@ class RootTypedef(Typedef):
             '{c_type}'
         )'''
 
+    callback_pointer_param_conversion_template = '''\
+        {param_name} = _get_py_callback_ptr(
+            {param_name},
+            '{c_type}'
+        )'''
+
     callback_template = '''\
 @_lib_lvgl.ffi.def_extern(
     name='py_lv_{func_name}'
@@ -997,17 +1164,29 @@ def __{func_name}_callback_func({params}):
         try:
             res = func({param_names})
 
-            if res is None:
-                return None
-
-            return _get_c_obj(res, '{ret_type}')
+            return _get_callback_return(
+                res,
+                '{ret_type}',
+                {ret_ptr}
+            )
 
         except:  # NOQA
             import traceback
 
             traceback.print_exc()
+
+            return _get_callback_return(
+                None,
+                '{ret_type}',
+                {ret_ptr}
+            )
     else:
         print('"{func_name}" is not registered')
+        return _get_callback_return(
+            None,
+            '{ret_type}',
+            {ret_ptr}
+        )        
 '''
 
     pyi_callback_template = '{func_name} = Callable[{param_types}, {ret_type}]'
@@ -1025,11 +1204,16 @@ def __{func_name}_callback_func({params}):
                     else:
                         ptr = False
 
-                    name = s_type._declname  # NOQA
+                    # The callback typedef name belongs to the Typedef node
+                    # (`self.name`). Using the return TypeDecl's declname is
+                    # unreliable for function-pointer typedefs and can be
+                    # None, which prevents callback trampolines such as
+                    # lv_fs_open_cb_t / lv_fs_read_cb_t from being emitted.
+                    name = self.name or s_type._declname  # NOQA
 
                     for item in ('_cb_t', '_f_t'):
 
-                        if item in name:
+                        if name and item in name:
                             if name.replace('lv_', '', 1) in py_callback_names:
                                 return
 
@@ -1047,8 +1231,9 @@ def __{func_name}_callback_func({params}):
                             param_types = []
                             param_conversions = []
                             arg_user_data = False
+                            user_data = None
 
-                            for param in self.type.type.args.params:
+                            for param_index, param in enumerate(self.type.type.args.params):
                                 p_ptr = False
 
                                 if isinstance(param, Typename):
@@ -1074,6 +1259,15 @@ def __{func_name}_callback_func({params}):
 
                                     elif isinstance(p_type, TypeDecl):
                                         p_type = p_type.type
+
+                                        # In C, func(void) means zero parameters.
+                                        if (
+                                                param_name is None and
+                                                isinstance(p_type, IdentifierType) and
+                                                p_type.names == ['void']
+                                        ):
+                                            continue
+
                                         param_type = get_py_type(
                                             p_type.names[0]
                                         )
@@ -1119,8 +1313,18 @@ def __{func_name}_callback_func({params}):
                                             )
 
                                     elif isinstance(p_type, TypeDecl):
+                                        p_type = p_type.type
+
+                                        # In C, func(void) means zero parameters.
+                                        if (
+                                                param_name is None and
+                                                isinstance(p_type, IdentifierType) and
+                                                p_type.names == ['void']
+                                        ):
+                                            continue
+
                                         param_type = get_py_type(
-                                            p_type.type.names[0]
+                                            p_type.names[0]
                                         )
 
                                     elif isinstance(p_type, ArrayDecl):
@@ -1133,16 +1337,30 @@ def __{func_name}_callback_func({params}):
                                 else:
                                     raise RuntimeError(str(type(param)))
 
+                                # C prototypes may omit parameter names. Python cannot.
+                                if param_name is None:
+                                    param_name = f'arg{param_index}'
+
                                 if param_name == 'user_data':
-                                    arg_user_data = len(param_names) - 1
+                                    arg_user_data = len(param_names)
                                     param_type = 'Any'
                                 else:
+                                    c_type = (
+                                        'void'
+                                        if param_type in ('None', None)
+                                        else param_type.replace('"', '')
+                                    )
+
+                                    conversion_template = (
+                                        self.callback_pointer_param_conversion_template
+                                        if p_ptr
+                                        else self.callback_param_conversion_template
+                                    )
+
                                     param_conversions.append(
-                                        self.callback_param_conversion_template.format(  # NOQA
+                                        conversion_template.format(
                                             param_name=param_name,
-                                            c_type='void'
-                                            if param_type in ('None', None)
-                                            else param_type.replace('"', '')
+                                            c_type=c_type,
                                         )
                                     )
 
@@ -1172,13 +1390,30 @@ def __{func_name}_callback_func({params}):
                                 param_conversions = ''
 
                             if arg_user_data is False:
-                                struct_userdata = (
-                                    self.struct_userdata_template.format(
-                                        param_name=param_names[0]
+                                if not param_names:
+                                    struct_userdata = 'cb_store = _global_cb_store'
+                                    user_data = 'global'
+                                    param_names = ''
+                                else:
+                                    struct_userdata = (
+                                        self.struct_userdata_template.format(
+                                            param_name=param_names[0]
+                                        )
                                     )
-                                )
+                                    if name.replace('lv_', '', 1) == 'event_cb_t':
+                                        struct_userdata = (
+                                            'cb_store = _lib_lvgl.ffi.from_handle('
+                                            '_lib_lvgl.lib.lv_event_get_user_data('
+                                            f'{param_names[0]}))'
+                                        )
+                                    elif name.replace('lv_', '', 1) == 'timer_cb_t':
+                                        struct_userdata = (
+                                            'cb_store = _lib_lvgl.ffi.from_handle('
+                                            '_lib_lvgl.lib.lv_timer_get_user_data('
+                                            f'{param_names[0]}))'
+                                        )
                             else:
-                                param_names.insert(arg_user_data, 'None')
+                                param_names[arg_user_data] = "cb_store.get('user_data', None)"
                                 struct_userdata = self.arg_user_data_template
 
                             if param_names:
@@ -1197,7 +1432,7 @@ def __{func_name}_callback_func({params}):
                                     )
                                 else:
                                     param_names = ', '.join(param_names)
-                            else:
+                            elif user_data != 'global':
                                 user_data = None
                                 param_names = ''
 
@@ -1214,16 +1449,18 @@ def __{func_name}_callback_func({params}):
                                 params = ''
 
                             if user_data is not None:
+                                callback_code = self.callback_template.format(
+                                    func_name=name.replace('lv_', '', 1),
+                                    params=params,
+                                    user_data=user_data,
+                                    param_conversion=param_conversions,
+                                    param_names=param_names,
+                                    struct_userdata=struct_userdata,
+                                    ret_type=str(ret_type).replace('"', ''),
+                                    ret_ptr='True' if ptr else 'False',
+                                )
                                 callbacks.append(
-                                    self.callback_template.format(
-                                        func_name=name.replace('lv_', '', 1),
-                                        params=params,
-                                        user_data=user_data,
-                                        param_conversion=param_conversions,
-                                        param_names=param_names,
-                                        struct_userdata=struct_userdata,
-                                        ret_type=str(ret_type).replace('"', '')
-                                    )
+                                    callback_code
                                 )
 
                                 cb = self.pyi_callback_template.format(
@@ -1247,8 +1484,28 @@ def __{func_name}_callback_func({params}):
         name, type_, code = self.type.gen_py()
 
         if isinstance(self.type, TypeDecl):
+            if isinstance(self.type.type, Enum):
+                if name not in py_int_type_names:
+                    base_type = (
+                        type_ if type_ and type_ != name
+                        else find_int_type(name) or 'int_'
+                    )
+                    py_int_type_names.append(name)
+                    py_int_types.append(
+                        self.template.format(
+                            typedef_name=name,
+                            typedef_type=base_type
+                        )
+                    )
+                return
+
             if type_:
                 type_ = type_.replace('"', '')
+
+            # TypeDecl already emitted anonymous enum typedefs as integer
+            # classes, and it added their constants to py_enums.
+            if code and name == type_ and name in py_int_type_names:
+                return
 
             if code and '_lib_lvgl.lib.' in code and 'LV_' in code:
                 if name and type_ and name == type_:
@@ -1294,6 +1551,19 @@ def __{func_name}_callback_func({params}):
 
                 if code:
                     if code.startswith('class'):
+                        # A forward declaration can be visited before the full
+                        # struct definition. Replace the opaque placeholder so
+                        # fields such as lv_anim_t.user_data remain available.
+                        if type_ in py_struct_names and 'def __init__' in code:
+                            class_prefix = f'class {type_}(_StructUnion):'
+                            for index, old_code in enumerate(py_structs):
+                                if old_code.startswith(class_prefix):
+                                    py_structs[index] = code
+                                    if name and name not in py_struct_names:
+                                        py_struct_names.append(name)
+                                    break
+                            else:
+                                pass
                         if (
                                 name and type_ and
                                 name not in py_struct_names and
@@ -1355,6 +1625,7 @@ def __{func_name}_callback_func({params}):
 
         elif isinstance(self.type, PtrDecl):
             if (
+                    code is not None and
                     name not in
                     py_type_names + py_callback_names +
                     py_typedef_names + py_struct_names +
@@ -1461,6 +1732,17 @@ class {name}({type}):
                     if e_type:
                         type_ = e_type
 
+                    if type_ is None:
+                        public_name = name[1:] if name.startswith('_') else name
+                        if public_name not in py_int_type_names:
+                            py_int_type_names.append(public_name)
+                            py_int_types.append(
+                                self.int_type_template.format(
+                                    name=public_name,
+                                    type='int_'
+                                )
+                            )
+
                 if '{type}' in code:
                     if type_:
                         code = code.format(type=type_)
@@ -1473,7 +1755,11 @@ class {name}({type}):
                             py_enums.append(code)
                         return
                     else:
-                        raise RuntimeError
+                        # Anonymous C enums have no typedef name.
+                        code = code.format(type='int_')
+                        if _check_code(code):
+                            py_enums.append(code)
+                        return
 
                 if name and type_ and name != type_:
                     if name not in py_int_type_names:
@@ -1498,15 +1784,39 @@ class {name}({type}):
         elif isinstance(self.type, TypeDecl):
             name, type_, code = self.type.gen_py()
 
-            if code:
-                if not name and d_name:
-                    name = d_name
+            if not name and d_name:
+                name = d_name
 
-                code = '{name}: {type} = ...'.format(name=name, type=code)
+            if code:
+                code = '{name}: {type} = ...'.format(
+                    name=name,
+                    type=code,
+                )
 
                 if name not in py_type_names:
                     py_type_names.append(name)
                     py_types.append(code)
+
+            # Export LVGL widget class descriptors.
+            #
+            # e.g.
+            # extern const lv_obj_class_t lv_msgbox_backdrop_class;
+            elif (
+                'extern' in self.storage
+                and name
+                and name.endswith('_class')
+                and type_
+                and type_.replace('"', '') == 'obj_class_t'
+            ):
+                if name not in py_global_names:
+                    py_global_names.append(name)
+
+                    py_globals.append(
+                        '{name} = _lib_lvgl.lib.py_get_{c_name}()'.format(
+                            name=name,
+                            c_name=self.name,
+                        )
+                    )
 
         elif isinstance(self.type, PtrDecl):
             name, type_, code = self.type.gen_py()
@@ -1524,7 +1834,13 @@ class {name}({type}):
                 if not name and d_name:
                     name = d_name
 
-                if name not in py_struct_names:
+                if name in py_struct_names and 'def __init__' in code:
+                    class_prefix = f'class {name}(_StructUnion):'
+                    for index, old_code in enumerate(py_structs):
+                        if old_code.startswith(class_prefix):
+                            py_structs[index] = code
+                            break
+                elif name not in py_struct_names:
                     py_struct_names.append(name)
                     py_structs.append(code)
 
@@ -1631,6 +1947,11 @@ TEMPLATE = '''\
 # ************************************************
 
 
+# ******************  GLOBALS  *******************
+{globals_}
+# ************************************************
+
+
 # **************  CALLBACK TYPES  ****************
 {callback_types}
 # ************************************************
@@ -1712,12 +2033,50 @@ for i in range(8, 50, 2):
 TEMPLATE += 'del __build_font\n'
 
 
-def run(output_path, ast):
+def _join_generated(items):
+    return '\n\n'.join(item for item in items if item is not None)
+
+
+def _reset_generation_state():
+    for collection in (
+        py_globals,
+        py_global_names,
+        callbacks,
+        py_enums,
+        py_enum_names,
+        py_int_types,
+        py_int_type_names,
+        py_callbacks,
+        py_callback_names,
+        py_typedefs,
+        py_typedef_names,
+        py_funcs,
+        py_func_names,
+        py_structs,
+        py_struct_names,
+        py_types,
+        py_type_names,
+    ):
+        collection.clear()
+
+
+def run(output_path, source):
+    _reset_generation_state()
     patch_pycparser()
 
     globs = GlobalsWrapper()
 
-    for child in ast:
+    children = (
+        source.generator_nodes
+        if isinstance(source, BindingModel)
+        else source
+    )
+    for child in children:
+        if isinstance(child, str):
+            node = eval(f'Root{child}', globs)
+            node.gen_py()
+            continue
+
         # check to see if this "child" (node) is from the
         # fake_lib_c includes if it is then we skip it since it
         # is not needed
@@ -1744,16 +2103,20 @@ def run(output_path, ast):
 
     base_path = os.path.dirname(__file__)
 
-    with open(os.path.join(output_path, '__init__.py'), 'w') as f:
+    with open(os.path.join(output_path, '_raw.py'), 'w') as f:
         f.write(
-            TEMPLATE.format(
-                py_template=open(os.path.join(base_path, 'lvgl.template.py'), 'r').read(),
-                int_types='\n\n'.join(py_int_types),
-                enums='\n\n'.join(py_enums),
-                structs='\n\n'.join(py_structs),
-                callback_types='\n\n'.join(py_callbacks),
-                callbacks='\n\n'.join(callbacks),
-                typedefs='\n\n'.join(py_typedefs),
-                functions='\n\n'.join(py_funcs)
-            )
+        TEMPLATE.format(
+            py_template=open(
+                os.path.join(base_path, 'lvgl.template.py'),
+                'r'
+            ).read(),
+            int_types='\n\n'.join(py_int_types),
+            enums='\n\n'.join(py_enums),
+            structs='\n\n'.join(py_structs),
+            globals_='\n\n'.join(py_globals),
+            callback_types='\n\n'.join(py_callbacks),
+            callbacks='\n\n'.join(callbacks),
+            typedefs='\n\n'.join(py_typedefs),
+            functions='\n\n'.join(py_funcs),
         )
+    )
